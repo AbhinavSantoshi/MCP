@@ -1,0 +1,14 @@
+"mcp": {
+    "servers": {
+      "planner": {
+        "type": "stdio",
+        "command": "python",
+        "args": [
+          "C:\\Users\\absantos\\Downloads\\CursorAI\\MCP\\PlannerToolsNew.py"
+        ],
+        "env": {
+          "PLANNER_PREFERRED_BROWSER": "chrome"
+        }
+      }
+    }
+  },
