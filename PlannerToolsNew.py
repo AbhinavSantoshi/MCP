@@ -859,6 +859,164 @@ async def planner_find_plans():
     log_step("TOOL_SUCCESS", "planner_find_plans completed")
     return results
 
+# Tool: Generate status report for a plan
+@mcp.tool()
+async def planner_generate_status_report(plan_id: str, include_details: bool = False):
+    """Generate a comprehensive status report for a plan"""
+    log_step("TOOL_START", f"planner_generate_status_report for plan {plan_id}")
+    try:
+        from datetime import datetime, timezone, timedelta
+        
+        # Step 1: Get plan details
+        log_step("STATUS_PLAN_DETAILS", "Fetching plan details")
+        plan_data = call_graph_api(f"planner/plans/{plan_id}")
+        
+        # Step 2: Get all tasks for the plan
+        log_step("STATUS_TASKS", "Fetching tasks")
+        tasks_data = call_graph_api(f"planner/plans/{plan_id}/tasks")
+        tasks = tasks_data.get("value", [])
+        
+        # Step 3: Get buckets for better categorization
+        log_step("STATUS_BUCKETS", "Fetching buckets")
+        buckets_data = call_graph_api(f"planner/plans/{plan_id}/buckets")
+        buckets = buckets_data.get("value", [])
+        bucket_map = {b["id"]: b["name"] for b in buckets}
+        
+        # Step 4: Fetch task details if requested
+        task_details_map = {}
+        if include_details and tasks:
+            log_step("STATUS_TASK_DETAILS", "Fetching detailed task information")
+            for task in tasks[:min(len(tasks), 10)]:  # Limit to 10 tasks to avoid API throttling
+                try:
+                    task_id = task.get("id")
+                    task_details = call_graph_api(f"planner/tasks/{task_id}/details")
+                    task_details_map[task_id] = task_details
+                except Exception as e:
+                    log_debug(f"Error fetching details for task {task_id}: {str(e)}")
+        
+        # Step 5: Analyze tasks and organize by status
+        now = datetime.now(timezone.utc)
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow = today + timedelta(days=1)
+        next_week = today + timedelta(days=7)
+        
+        completed_tasks = []
+        overdue_tasks = []
+        due_today_tasks = []
+        due_this_week_tasks = []
+        upcoming_tasks = []
+        no_due_date_tasks = []
+        
+        for task in tasks:
+            task_id = task.get("id")
+            title = task.get("title")
+            percent_complete = task.get("percentComplete", 0)
+            bucket_id = task.get("bucketId")
+            bucket_name = bucket_map.get(bucket_id, "Unknown bucket")
+            due_date_str = task.get("dueDateTime")
+            
+            task_info = {
+                "id": task_id,
+                "title": title,
+                "percentComplete": percent_complete,
+                "bucket": bucket_name
+            }
+            
+            # Include additional details if available
+            if include_details and task_id in task_details_map:
+                details = task_details_map[task_id]
+                task_info["description"] = details.get("description", "")
+                task_info["checklist"] = {
+                    "total": len(details.get("checklist", {})),
+                    "completed": sum(1 for item in details.get("checklist", {}).values() 
+                                   if isinstance(item, dict) and item.get("isChecked", False))
+                }
+            
+            # Check if task is completed
+            if percent_complete == 100:
+                completed_tasks.append(task_info)
+                continue
+                
+            # Categorize by due date
+            if not due_date_str:
+                no_due_date_tasks.append(task_info)
+                continue
+                
+            try:
+                due_date = datetime.fromisoformat(due_date_str.replace('Z', '+00:00'))
+                task_info["dueDate"] = due_date.strftime("%Y-%m-%d")
+                
+                if due_date < today:
+                    overdue_tasks.append(task_info)
+                elif due_date < tomorrow:
+                    due_today_tasks.append(task_info)
+                elif due_date < next_week:
+                    due_this_week_tasks.append(task_info)
+                else:
+                    upcoming_tasks.append(task_info)
+            except Exception as e:
+                log_debug(f"Error parsing due date {due_date_str} for task {task_id}: {str(e)}")
+                no_due_date_tasks.append(task_info)
+        
+        # Step 6: Calculate summary statistics
+        total_tasks = len(tasks)
+        completed_count = len(completed_tasks)
+        overdue_count = len(overdue_tasks)
+        due_today_count = len(due_today_tasks)
+        due_this_week_count = len(due_this_week_tasks)
+        
+        # Overall completion percentage
+        completion_percentage = 0
+        if total_tasks > 0:
+            completion_percentage = int(sum(task.get("percentComplete", 0) for task in tasks) / total_tasks)
+        
+        # Step 7: Compile the report
+        report = {
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "plan": {
+                "id": plan_id,
+                "title": plan_data.get("title"),
+                "owner": plan_data.get("owner"),
+                "created_datetime": plan_data.get("createdDateTime")
+            },
+            "summary": {
+                "total_tasks": total_tasks,
+                "completed_tasks": completed_count,
+                "overdue_tasks": overdue_count,
+                "due_today": due_today_count,
+                "due_this_week": due_this_week_count,
+                "overall_completion_percentage": completion_percentage,
+                "buckets": len(buckets)
+            },
+            "tasks_by_status": {
+                "completed": completed_tasks[:10],  # Limit to 10 for readability
+                "overdue": overdue_tasks,
+                "due_today": due_today_tasks,
+                "due_this_week": due_this_week_tasks,
+                "upcoming": upcoming_tasks[:10],  # Limit to 10 for readability
+                "no_due_date": no_due_date_tasks[:10]  # Limit to 10 for readability
+            }
+        }
+        
+        # Step 8: Format the report for better readability
+        formatted_report = {
+            PlannerObjectIdKey: add_object(report),
+            "__PlannerObjType": "StatusReport",
+            "plan_title": plan_data.get("title"),
+            "generated_at": report["generated_at"],
+            "summary": report["summary"],
+            "completion_status": f"{report['summary']['completed_tasks']}/{report['summary']['total_tasks']} tasks completed ({report['summary']['overall_completion_percentage']}% overall)",
+            "urgent_attention": f"{report['summary']['overdue_tasks']} overdue, {report['summary']['due_today']} due today",
+            "tasks_by_status": report["tasks_by_status"],
+        }
+        
+        log_step("TOOL_SUCCESS", f"Status report generated for plan {plan_id}")
+        return formatted_report
+        
+    except Exception as e:
+        log_step("TOOL_ERROR", f"planner_generate_status_report - {str(e)}")
+        return {"error": str(e)}
+
 if __name__ == "__main__":
     log_step("SERVER_START", "Starting Planner MCP server")
     mcp.run(transport='stdio')
